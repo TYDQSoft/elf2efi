@@ -347,11 +347,17 @@ begin
 end;
 procedure tydq_move(const src;var dest;Size:natuint);
 var i:SizeUint;
+    q1,q2:Pqword;
     d1,d2:Pdword;
     w1,w2:Pword;
     b1,b2:Pbyte;
 begin
- if(Size-Size shr 2 shl 2=0) then
+ if(Size-size shr 3 shl 3=0) then
+  begin
+   q1:=Pqword(@src); q2:=Pqword(@dest);
+   for i:=1 to Size shr 3 do (q2+i-1)^:=(q1+i-1)^;
+  end
+ else if(Size-Size shr 2 shl 2=0) then
   begin
    d1:=Pdword(@src); d2:=Pdword(@dest);
    for i:=1 to Size shr 2 do (d2+i-1)^:=(d1+i-1)^;

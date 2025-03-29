@@ -744,6 +744,7 @@ type elf32_header=packed record
                 0:(ptr1:PByte;);
                 1:(ptr2:Pword;);
                 2:(ptr4:Pdword;);
+                3:(ptr8:Pqword;);
                 end;
     Pelf_content=^elf_content;
     elf_file=packed record
@@ -923,6 +924,7 @@ type elf32_header=packed record
                 0:(ptr1:PByte;);
                 1:(ptr2:Pword;);
                 2:(ptr4:Pdword;);
+                3:(ptr8:Pqword;);
                 end;
      Ppe_content=^pe_content;
      pe_file=packed record

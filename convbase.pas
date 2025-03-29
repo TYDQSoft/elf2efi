@@ -27,13 +27,17 @@ var f:TFileStream;
 begin
  f:=TFileStream.Create(fn,fmOpenRead);
  f.Seek(offset,0);
- if(size-size shr 2 shl 2=0) then
+ if(size-size shr 3 shl 3=0) then
   begin
-   for i:=1 to size shr 2 do f.Read(Pdword(Pointer(@dest)+(i-1)*4)^,4);
+   for i:=1 to size shr 3 do f.Read(Pqword(Pointer(@dest)+(i-1) shl 3)^,8);
+  end
+ else if(size-size shr 2 shl 2=0) then
+  begin
+   for i:=1 to size shr 2 do f.Read(Pdword(Pointer(@dest)+(i-1) shl 2)^,4);
   end
  else if(size-size shr 1 shl 1=0) then
   begin
-   for i:=1 to size shr 1 do f.Read(Pword(Pointer(@dest)+(i-1)*2)^,2);
+   for i:=1 to size shr 1 do f.Read(Pword(Pointer(@dest)+(i-1) shl 1)^,2);
   end
  else
   begin
@@ -47,13 +51,17 @@ var f:TFileStream;
 begin
  if(FileExists(fn)) then f:=TFileStream.Create(fn,fmOpenWrite) else f:=TFileStream.Create(fn,fmCreate);
  f.Seek(offset,0);
- if(size-size shr 2 shl 2=0) then
+ if(size-size shr 3 shl 3=0) then
   begin
-   for i:=1 to size shr 2 do f.Write(Pdword(Pointer(@source)+(i-1)*4)^,4);
+   for i:=1 to size shr 3 do f.Write(Pqword(Pointer(@source)+(i-1) shl 3)^,8);
+  end
+ else if(size-size shr 2 shl 2=0) then
+  begin
+   for i:=1 to size shr 2 do f.Write(Pdword(Pointer(@source)+(i-1) shl 2)^,4);
   end
  else if(size-size shr 1 shl 1=0) then
   begin
-   for i:=1 to size shr 1 do f.Write(Pword(Pointer(@source)+(i-1)*2)^,2);
+   for i:=1 to size shr 1 do f.Write(Pword(Pointer(@source)+(i-1) shl 1)^,2);
   end
  else
   begin
@@ -214,10 +222,10 @@ begin
        contentsize:=Pelf_section_header(Result.secheader+i-1)^.sec64.section_header_size;
        Pelf_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(contentsize);
        for j:=1 to contentsize do
-         begin
-          conv_io_read(fn,(Pelf_content(Result.seccontent+i-1)^.ptr1+j-1)^,
-          contentoffset+j-1,1);
-         end;
+        begin
+         conv_io_read(fn,(Pelf_content(Result.seccontent+i-1)^.ptr1+j-1)^,
+         contentoffset+j-1,1);
+        end;
       end
      else if(Pelf_section_header(Result.secheader+i-1)^.sec64.section_header_size>0)
      and(Pelf_section_header(Result.secheader+i-1)^.sec64.section_header_type=
