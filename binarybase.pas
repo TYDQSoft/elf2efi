@@ -937,6 +937,7 @@ type elf32_header=packed record
              secheader:Ppe_image_section_header;
              seccontentaddress:qword;
              seccontent:Ppe_content;
+             peSize:dword;
              end;
 
 function elf_least_byte_to_most_byte(lsb:word):word;

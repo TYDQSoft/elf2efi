@@ -10,6 +10,10 @@ type file_section_list=packed record
                        secindex:Pword;
                        seccount:byte;
                        end;
+     file_relative_offset=packed record
+                          baseaddr:SizeUint;
+                          offset:SizeUint;
+                          end;
 
 function conv_read_elf(fn:string):elf_file;
 function conv_elf_to_efi(elf:elf_file;apptype:byte):pe_file;
@@ -276,13 +280,14 @@ begin
   begin
    sum:=0; csum:=checksum; dataptr:=buf; len:=buflen;
    repeat
-    sum:=Pword(dataptr)^+csum;
-    csum:=Word(sum)+sum shr 16;
+    sum:=(Pword(dataptr)^+csum) and $FFFFFFFF;
+    csum:=(Word(sum)+sum shr 16) and $FFFFFFFF;
     inc(dataptr,2);
     dec(len);
    until(len=0);
+   Result:=(csum+csum shr 16);
   end
- else Result:=checksum+checksum shr 16;
+ else Result:=(checksum+checksum shr 16) and $FFFFFFFF;
 end;
 function conv_generate_timestamp:dword;
 const monthdata1:array[1..12] of byte=(31,28,31,30,31,30,31,31,30,31,30,31);
@@ -290,7 +295,6 @@ const monthdata1:array[1..12] of byte=(31,28,31,30,31,30,31,31,30,31,30,31);
 var tempres:TSystemTime;
     i,j:word;
     bool:boolean;
-    res:dword;
 begin
  DateTimeToSystemTime(Now,tempres);
  i:=1970; Result:=0;
@@ -353,12 +357,11 @@ begin
    inc(i);
   end;
 end;
-function conv_efi_to_buffer(efi:pe_file):PByte;
+function conv_efi_to_buffer(efi:pe_file;efiSize:SizeUint):PByte;
 var buf:Pbyte=nil;
     i,size,writepos:SizeUint;
 begin
- if(efi.bit=32) then buf:=conv_allocmem(efi.imageheader.OptionalHeader.SizeOfImage)
- else if(efi.bit=64) then buf:=conv_allocmem(efi.imageheader.OptionalHeader64.SizeOfImage);
+ buf:=conv_allocmem(efiSize);
  writepos:=0;
  conv_move(efi.dosheader,buf^,sizeof(pe_image_dos_header));
  writepos:=sizeof(pe_image_dos_header);
@@ -391,10 +394,41 @@ begin
   end;
  Result:=buf;
 end;
+function conv_get_efi_relative_offset(elftextoffset,elfrodataoffset,elfdataoffset:SizeUint;
+petextoffset,perodataoffset,pedataoffset:SizeUint;
+addrneedlocate:SizeUint):file_relative_offset;
+begin
+ if(elfrodataoffset<>0) then
+  begin
+   if(addrneedlocate<=elfrodataoffset) then
+    begin
+     Result.baseaddr:=petextoffset; Result.offset:=addrneedlocate-elftextoffset;
+    end
+   else if(addrneedlocate<=elfdataoffset) then
+    begin
+     Result.baseaddr:=perodataoffset; Result.offset:=addrneedlocate-elfrodataoffset;
+    end
+   else
+    begin
+     Result.baseaddr:=pedataoffset; Result.offset:=addrneedlocate-elfdataoffset;
+    end;
+  end
+ else
+  begin
+   if(addrneedlocate<=elfdataoffset) then
+    begin
+     Result.baseaddr:=petextoffset; Result.offset:=addrneedlocate-elftextoffset;
+    end
+   else
+    begin
+     Result.baseaddr:=pedataoffset; Result.offset:=addrneedlocate-elfdataoffset;
+    end;
+  end;
+end;
 function conv_elf_to_efi(elf:elf_file;apptype:byte):pe_file;
 var entrystart,highaddress,addralign:SizeUint;
     elftextaddress,elfrodataaddress,elfdataaddress:SizeUint;
-    perodataaddress,pedataaddress,perelocaddress:SizeUint;
+    petextaddress,perodataaddress,pedataaddress,perelocaddress:SizeUint;
     rela:elf_rela_list;
     havetext,haverodata,havedata:boolean;
     textlist,rodatalist,datalist:file_section_list;
@@ -407,11 +441,27 @@ var entrystart,highaddress,addralign:SizeUint;
     newoffset,newaddend,baseoffset,typeoffsetcount:SizeUint;
     writeoffset,writeptr:SizeUint;
     efibuf:PByte;
+    {For Offset in elf file}
+    elffiletextstart,elffiletextend:SizeUint;
+    elffilerodatastart,elffilerodataend:SizeUint;
+    elffiledatastart,elffiledataend:SizeUint;
+    pefiletextoffset,pefilerodataoffset,pefiledataoffset,pefilerelocoffset:SizeUint;
+    {For File Relative Offset}
+    peRelaoffset:file_relative_offset;
+    {For File Size}
+    peFileSize:SizeUint;
 begin
+ {Initialize the file offset}
+ elffiletextstart:=0; elffiletextend:=0;
+ elffilerodatastart:=0; elffilerodataend:=0;
+ elffiledatastart:=0; elffiledataend:=0;
+ {Initialize the used variables}
  elftextaddress:=0; elfrodataaddress:=0; elfdataaddress:=0;
  havetext:=false; haverodata:=false; havedata:=false;
  textlist.seccount:=0; rodatalist.seccount:=0; datalist.seccount:=0;
  textlist.secindex:=nil; rodatalist.secindex:=nil; datalist.secindex:=nil;
+ petextaddress:=0; perodataaddress:=0; pedataaddress:=0; perelocaddress:=0;
+ pefiletextoffset:=0; pefilerodataoffset:=0; pefiledataoffset:=0; pefilerelocoffset:=0;
  baseoffset:=0;
  {Initialize the PE header}
  for i:=1 to sizeof(pe_file) do PByte(Pointer(@Result)+i-1)^:=0;
@@ -435,12 +485,14 @@ begin
      elf_section_header_flag_exec_instr or elf_section_header_flag_alloc) and (havetext=false) then
       begin
        elftextaddress:=Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address;
+       elffiletextstart:=elftextaddress;
        havetext:=true;
       end
      else if(Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_flags=
      elf_section_header_flag_alloc) and (havetext) and (haverodata=false) then
       begin
        elfrodataaddress:=Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address;
+       elffilerodatastart:=elfrodataaddress;
        haverodata:=true;
       end
      else if(Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_flags=
@@ -448,6 +500,7 @@ begin
      and (havetext) and (havedata=false) then
       begin
        elfdataaddress:=Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address;
+       elffiledatastart:=elfdataaddress;
        havedata:=true;
       end;
      if(Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_flags=
@@ -456,6 +509,8 @@ begin
       begin
        inc(textlist.seccount);
        conv_reallocmem(textlist.secindex,textlist.seccount*2);
+       elffiletextend:=Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address
+       +Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_size;
        (textlist.secindex+textlist.seccount-1)^:=i;
       end
      else if(Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_flags=
@@ -463,6 +518,8 @@ begin
       begin
        inc(rodatalist.seccount);
        conv_reallocmem(rodatalist.secindex,rodatalist.seccount*2);
+       elffilerodataend:=Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address
+       +Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_size;
        (rodatalist.secindex+rodatalist.seccount-1)^:=i;
       end
      else if(Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_flags=
@@ -471,6 +528,8 @@ begin
       begin
        inc(datalist.seccount);
        conv_reallocmem(datalist.secindex,datalist.seccount*2);
+       elffiledataend:=Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address
+       +Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_size;
        (datalist.secindex+datalist.seccount-1)^:=i;
       end;
      if(Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address
@@ -483,7 +542,7 @@ begin
      elf_section_header_flag_alloc=elf_section_header_flag_alloc) and
      (Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address_align>addralign) then
       begin
-       addralign:=Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_address_align;
+       addralign:=Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_address_align;
       end;
      if(Pelf_section_header(elf.secheader+i-1)^.sec32.section_header_type=elf_section_header_rela) then
       begin
@@ -506,7 +565,7 @@ begin
    Result.imageheader.FileHeader.SizeOfOptionalHeader:=sizeof(pe_image_nt_header32);
    Result.imageheader.FileHeader.Characteristics:=
    pe_image_file_executable_image or pe_image_file_line_nums_stripped
-   or pe_image_file_local_syms_stripped or pe_image_file_debug_stripped;
+   or pe_image_file_local_syms_stripped or pe_image_file_debug_stripped or pe_image_file_large_address_aware;
    Result.imageheader.FileHeader.TimeDateStamp:=conv_generate_timestamp;
    if(elf.header.head32.elf32_machine=elf_machine_386) then
     begin
@@ -532,40 +591,44 @@ begin
    sizeof(pe_image_section_header)*Result.imageheader.FileHeader.NumberOfSections+
    addralign-1) div addralign*addralign;
    {Make it ELF executable compatible}
-   if(Result.seccontentaddress<elftextaddress) then Result.seccontentaddress:=elftextaddress;
+   petextaddress:=elftextaddress;
    Result.seccontent:=conv_allocmem(sizeof(pe_content)*efiseccount);
    {Generate the PE section position}
    if(elfrodataaddress<>0) then
     begin
-     perodataaddress:=Result.seccontentaddress+elfrodataaddress-elftextaddress;
+     perodataaddress:=petextaddress+elfrodataaddress-elftextaddress;
      pedataaddress:=perodataaddress+elfdataaddress-elfrodataaddress;
      perelocaddress:=pedataaddress+highaddress-elfdataaddress;
+     pefiletextoffset:=Result.seccontentaddress;
+     pefilerodataoffset:=pefiletextoffset+elffiletextend-elffiletextstart;
+     pefiledataoffset:=pefilerodataoffset+elffilerodataend-elffilerodatastart;
+     pefilerelocoffset:=pefiledataoffset+elffiledataend-elffiledatastart;
     end
    else
     begin
      perodataaddress:=0;
-     pedataaddress:=Result.seccontentaddress+elfdataaddress-elftextaddress;
+     pedataaddress:=petextaddress+elfdataaddress-elftextaddress;
      perelocaddress:=pedataaddress+highaddress-elfdataaddress;
+     pefiletextoffset:=Result.seccontentaddress;
+     pefiledataoffset:=pefiletextoffset+elffiletextend-elffiletextstart;
+     pefilerelocoffset:=pefiledataoffset+elffiledataend-elffiledatastart;
     end;
    {Generate the Optional Header}
-   Result.imageheader.OptionalHeader.AddressOfEntryPoint:=
-   entrystart-elftextaddress+Result.seccontentaddress;
-   Result.imageheader.OptionalHeader.Magic:=pe_image_pe32_image_magic;
-   Result.imageheader.OptionalHeader.MajorLinkerVersion:=1;
+   Result.imageheader.OptionalHeader.AddressOfEntryPoint:=entrystart;
+   Result.imageheader.OptionalHeader.Magic:=pe_image_pe32plus_image_magic;
+   Result.imageheader.OptionalHeader.MajorLinkerVersion:=0;
    Result.imageheader.OptionalHeader.MinorLinkerVersion:=0;
-   Result.imageheader.OptionalHeader.MajorImageVersion:=1;
+   Result.imageheader.OptionalHeader.MajorImageVersion:=0;
    Result.imageheader.OptionalHeader.MinorImageVersion:=0;
-   Result.imageheader.OptionalHeader.MajorOperatingSystemVersion:=1;
+   Result.imageheader.OptionalHeader.MajorOperatingSystemVersion:=0;
    Result.imageheader.OptionalHeader.MinorOperatingSystemVersion:=0;
-   Result.imageheader.OptionalHeader.MajorSubsystemVersion:=1;
+   Result.imageheader.OptionalHeader.MajorSubsystemVersion:=0;
    Result.imageheader.OptionalHeader.MinorSubsystemVersion:=0;
    Result.imageheader.OptionalHeader.Checksum:=0;
    Result.imageheader.OptionalHeader.ImageBase:=$00000000;
-   Result.imageheader.OptionalHeader.BaseOfCode:=Result.seccontentaddress;
-   if(elfrodataaddress<>0) then
-   Result.imageheader.OptionalHeader.BaseOfData:=elfrodataaddress-elftextaddress+Result.seccontentaddress
-   else
-   Result.imageheader.OptionalHeader.BaseOfData:=elfdataaddress-elftextaddress+Result.seccontentaddress;
+   Result.imageheader.OptionalHeader.BaseOfCode:=petextaddress;
+   if(perodataaddress<>0) then Result.imageheader.OptionalHeader.BaseOfData:=perodataaddress
+   else Result.imageheader.OptionalHeader.BaseOfData:=pedataaddress;
    Result.ImageHeader.OptionalHeader.SectionAlignment:=addralign;
    Result.imageheader.OptionalHeader.Subsystem:=apptype;
    Result.imageheader.OptionalHeader.Win32VersionValue:=0;
@@ -598,7 +661,7 @@ begin
    if(haverodata) then
     begin
      i:=1;
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elfrodataaddress-elftextaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffiletextend-elffiletextstart);
      for j:=1 to textlist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(textlist.secindex+j-1)^-1)^.ptr1);
@@ -610,7 +673,7 @@ begin
        conv_move(Pbyte(tempaddress1)^,Pbyte(tempaddress2)^,tempsize);
       end;
      inc(i);
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elfdataaddress-elfrodataaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffilerodataend-elffilerodatastart);
      for j:=1 to rodatalist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(rodatalist.secindex+j-1)^-1)^.ptr1);
@@ -622,7 +685,7 @@ begin
        conv_move(Pbyte(tempaddress1)^,Pbyte(tempaddress2)^,tempsize);
       end;
      inc(i);
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(highaddress-elfdataaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffiledataend-elffiledatastart);
      for j:=1 to datalist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(datalist.secindex+j-1)^-1)^.ptr1);
@@ -637,7 +700,7 @@ begin
    else
     begin
      i:=1;
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elfdataaddress-elftextaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffiletextend-elffiletextstart);
      for j:=1 to textlist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(textlist.secindex+j-1)^-1)^.ptr1);
@@ -649,7 +712,7 @@ begin
        conv_move(Pbyte(tempaddress1)^,Pbyte(tempaddress2)^,tempsize);
       end;
      inc(i);
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(highaddress-elfdataaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffiledataend-elffiledatastart);
      for j:=1 to datalist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(datalist.secindex+j-1)^-1)^.ptr1);
@@ -668,42 +731,44 @@ begin
      j:=1; typeoffsetcount:=Pelf32_rela_item(rela.list32.item+i-1)^.count;
      while(j<=typeoffsetcount)do
       begin
-       newoffset:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset
-       -elftextaddress+Result.seccontentaddress;
-       newaddend:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_addend
-       -elftextaddress+Result.seccontentaddress;
-       {Search for the address it is exist}
-       if(elfrodataaddress=0) then
+       {Find the Relative Offset in PE file and write the add number}
+       peRelaoffset:=conv_get_efi_relative_offset(elftextaddress,elfrodataaddress,elfdataaddress,
+       pefiletextoffset,pefilerodataoffset,pefiledataoffset,
+       Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset);
+       newoffset:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset;
+       newaddend:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_addend;
+       if(pefilerodataoffset<>0) then
         begin
-         if(Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset<=elfdataaddress) then
+         if(newoffset>=pefiledataoffset) then
           begin
-           writeoffset:=newoffset-Result.seccontentaddress;
-           Pqword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
+           writeoffset:=newoffset-pefiledataoffset;
+           Pdword(Ppe_content(Result.seccontent+2)^.ptr1+writeoffset)^:=newaddend;
           end
-         else if(Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset<=highaddress) then
+         else if(newoffset>=pefilerodataoffset) then
           begin
-           writeoffset:=newoffset-Result.seccontentaddress-(elfdataaddress-elftextaddress);
-           Pqword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
+           writeoffset:=newoffset-pefilerodataoffset;
+           Pdword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
+          end
+         else
+          begin
+           writeoffset:=newoffset-pefiletextoffset;
+           Pdword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
           end;
         end
        else
         begin
-         if(Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset<=elfrodataaddress) then
+         if(newoffset>=pefiledataoffset) then
           begin
-           writeoffset:=newoffset-Result.seccontentaddress;
-           Pqword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
+           writeoffset:=newoffset-pefiledataoffset;
+           Pdword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
           end
-         else if(Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset<=elfdataaddress) then
+         else
           begin
-           writeoffset:=newoffset-Result.seccontentaddress-(elfrodataaddress-elftextaddress);
-           Pqword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
-          end
-         else if(Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset<=highaddress) then
-          begin
-           writeoffset:=newoffset-Result.seccontentaddress-(elfdataaddress-elftextaddress);
-           Pqword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
+           writeoffset:=newoffset-pefiletextoffset;
+           Pdword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
           end;
         end;
+       {If block exceeds limits,then create another block}
        if(j=1) or (newoffset-baseoffset>4095) then
         begin
          inc(breloclist.count); inc(relocsize,8);
@@ -712,6 +777,7 @@ begin
          baseoffset:=newoffset;
          Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.base.SizeOfBlock:=8;
          Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.count:=0;
+         Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.reloc:=nil;
         end;
        inc(relocsize,2);
        inc(Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.base.SizeOfBlock,2);
@@ -753,7 +819,7 @@ begin
      conv_reallocmem(breloclist.item,sizeof(pe_base_relocation_item)*breloclist.count);
      Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.base.VirtualAddress:=
      elfdataaddress-elftextaddress+Result.seccontentaddress;
-     Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.base.SizeOfBlock:=12;
+     Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.base.SizeOfBlock:=16;
      conv_reallocmem(Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.reloc,4);
      Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.count:=0;
      inc(Ppe_base_relocation_item(breloclist.item+breloclist.count-1)^.count);
@@ -805,15 +871,14 @@ begin
     begin
      Ppe_image_section_header(Result.secheader+i-1)^.Name:='.text';
      if(haverodata) then
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=elfrodataaddress-elftextaddress
-     else Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=elfdataaddress-elftextaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=perodataaddress-petextaddress
+     else Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=pedataaddress-petextaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.NumberOfLineNumbers:=0;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToLineNumbers:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize;
-     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=Result.seccontentaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=elffiletextend-elffiletextstart;
+     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pefiletextoffset;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToRelocation:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=Result.seccontentaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=petextaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.Characteristics:=
      pe_image_scn_cnt_code or pe_image_mem_read or pe_image_mem_execute;
     end;
@@ -821,15 +886,13 @@ begin
     begin
      inc(i);
      Ppe_image_section_header(Result.secheader+i-1)^.Name:='.rdata';
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=elfdataaddress-elfrodataaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=pedataaddress-perodataaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.NumberOfLineNumbers:=0;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToLineNumbers:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize;
-     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=perodataaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=elffilerodataend-elffilerodatastart;
+     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pefilerodataoffset;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToRelocation:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=elfrodataaddress-elftextaddress+
-     Result.seccontentaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=perodataaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.Characteristics:=
      pe_image_scn_cnt_initialized_data or pe_image_mem_read;
     end;
@@ -837,14 +900,13 @@ begin
     begin
      inc(i);
      Ppe_image_section_header(Result.secheader+i-1)^.Name:='.data';
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=highaddress-elfdataaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=perelocaddress-pedataaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.NumberOfLineNumbers:=0;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToLineNumbers:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=perelocaddress-pedataaddress;
-     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pedataaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=elffiledataend-elffiledatastart;
+     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pefiledataoffset;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToRelocation:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=elfdataaddress-elftextaddress+
-     Result.seccontentaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=pedataaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.Characteristics:=
      pe_image_scn_cnt_initialized_data or pe_image_mem_read or pe_image_mem_write;
     end;
@@ -854,22 +916,21 @@ begin
    Ppe_image_section_header(Result.secheader+i-1)^.NumberOfLineNumbers:=0;
    Ppe_image_section_header(Result.secheader+i-1)^.PointerToLineNumbers:=0;
    Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=relocsize;
-   Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=perelocaddress;
+   Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pefilerelocoffset;
    Ppe_image_section_header(Result.secheader+i-1)^.PointerToRelocation:=0;
-   Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=highaddress
-   -elftextaddress+Result.seccontentaddress;
+   Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=perelocaddress;
    Ppe_image_section_header(Result.secheader+i-1)^.Characteristics:=
    pe_image_scn_cnt_initialized_data or pe_image_mem_read or pe_image_mem_discardable;
-   Result.imageheader.OptionalHeader.DataDirectory[6].virtualaddress:=highaddress
-   -elftextaddress+Result.seccontentaddress;
+   Result.imageheader.OptionalHeader.DataDirectory[6].virtualaddress:=perelocaddress;
    Result.ImageHeader.OptionalHeader.DataDirectory[6].Size:=relocsize;
    Result.imageheader.OptionalHeader.FileAlignment:=addralign;
-   Result.imageheader.OptionalHeader.SizeOfImage:=(perelocaddress+relocsize+addralign-1)
-   div addralign*addralign;
+   pefileSize:=(pefilerelocoffset+relocsize+addralign-1) div addralign*addralign;
+   Result.imageheader.OptionalHeader.SizeOfImage:=
+   (perelocaddress+relocsize+addralign-1) div addralign*addralign;
    Result.ImageHeader.OptionalHeader.Checksum:=0;
-   efibuf:=conv_efi_to_buffer(Result);
-   Result.ImageHeader.OptionalHeader.Checksum:=
-   conv_generate_crc32(efibuf,Result.ImageHeader.OptionalHeader.SizeOfImage,$FFFFFFFF);
+   efibuf:=conv_efi_to_buffer(Result,peFileSize);
+   Result.peSize:=pefileSize;
+   Result.ImageHeader.OptionalHeader.Checksum:=conv_generate_crc32(efibuf,pefileSize,0);
    conv_freemem(efibuf);
   end
  else if(elf.bit=64) then
@@ -883,12 +944,14 @@ begin
      elf_section_header_flag_exec_instr or elf_section_header_flag_alloc) and (havetext=false) then
       begin
        elftextaddress:=Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_address;
+       elffiletextstart:=elftextaddress;
        havetext:=true;
       end
      else if(Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_flags=
      elf_section_header_flag_alloc) and (havetext) and (haverodata=false) then
       begin
        elfrodataaddress:=Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_address;
+       elffilerodatastart:=elfrodataaddress;
        haverodata:=true;
       end
      else if(Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_flags=
@@ -896,6 +959,7 @@ begin
      and (havetext) and (havedata=false) then
       begin
        elfdataaddress:=Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_address;
+       elffiledatastart:=elfdataaddress;
        havedata:=true;
       end;
      if(Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_flags=
@@ -904,6 +968,8 @@ begin
       begin
        inc(textlist.seccount);
        conv_reallocmem(textlist.secindex,textlist.seccount*2);
+       elffiletextend:=Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_address
+       +Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_size;
        (textlist.secindex+textlist.seccount-1)^:=i;
       end
      else if(Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_flags=
@@ -911,6 +977,8 @@ begin
       begin
        inc(rodatalist.seccount);
        conv_reallocmem(rodatalist.secindex,rodatalist.seccount*2);
+       elffilerodataend:=Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_address
+       +Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_size;
        (rodatalist.secindex+rodatalist.seccount-1)^:=i;
       end
      else if(Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_flags=
@@ -919,6 +987,8 @@ begin
       begin
        inc(datalist.seccount);
        conv_reallocmem(datalist.secindex,datalist.seccount*2);
+       elffiledataend:=Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_address
+       +Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_size;
        (datalist.secindex+datalist.seccount-1)^:=i;
       end;
      if(Pelf_section_header(elf.secheader+i-1)^.sec64.section_header_address
@@ -980,36 +1050,42 @@ begin
    sizeof(pe_image_section_header)*Result.imageheader.FileHeader.NumberOfSections+
    addralign-1) div addralign*addralign;
    {Make it ELF executable compatible}
-   if(Result.seccontentaddress<elftextaddress) then Result.seccontentaddress:=elftextaddress;
+   petextaddress:=elftextaddress;
    Result.seccontent:=conv_allocmem(sizeof(pe_content)*efiseccount);
    {Generate the PE section position}
    if(elfrodataaddress<>0) then
     begin
-     perodataaddress:=Result.seccontentaddress+elfrodataaddress-elftextaddress;
+     perodataaddress:=petextaddress+elfrodataaddress-elftextaddress;
      pedataaddress:=perodataaddress+elfdataaddress-elfrodataaddress;
      perelocaddress:=pedataaddress+highaddress-elfdataaddress;
+     pefiletextoffset:=Result.seccontentaddress;
+     pefilerodataoffset:=pefiletextoffset+elffiletextend-elffiletextstart;
+     pefiledataoffset:=pefilerodataoffset+elffilerodataend-elffilerodatastart;
+     pefilerelocoffset:=pefiledataoffset+elffiledataend-elffiledatastart;
     end
    else
     begin
      perodataaddress:=0;
-     pedataaddress:=Result.seccontentaddress+elfdataaddress-elftextaddress;
+     pedataaddress:=petextaddress+elfdataaddress-elftextaddress;
      perelocaddress:=pedataaddress+highaddress-elfdataaddress;
+     pefiletextoffset:=Result.seccontentaddress;
+     pefiledataoffset:=pefiletextoffset+elffiletextend-elffiletextstart;
+     pefilerelocoffset:=pefiledataoffset+elffiledataend-elffiledatastart;
     end;
    {Generate the Optional Header}
-   Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=
-   entrystart-elftextaddress+Result.seccontentaddress;
+   Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=entrystart;
    Result.imageheader.OptionalHeader64.Magic:=pe_image_pe32plus_image_magic;
-   Result.imageheader.OptionalHeader64.MajorLinkerVersion:=1;
+   Result.imageheader.OptionalHeader64.MajorLinkerVersion:=0;
    Result.imageheader.OptionalHeader64.MinorLinkerVersion:=0;
-   Result.imageheader.OptionalHeader64.MajorImageVersion:=1;
+   Result.imageheader.OptionalHeader64.MajorImageVersion:=0;
    Result.imageheader.OptionalHeader64.MinorImageVersion:=0;
-   Result.imageheader.OptionalHeader64.MajorOperatingSystemVersion:=1;
+   Result.imageheader.OptionalHeader64.MajorOperatingSystemVersion:=0;
    Result.imageheader.OptionalHeader64.MinorOperatingSystemVersion:=0;
-   Result.imageheader.OptionalHeader64.MajorSubsystemVersion:=1;
+   Result.imageheader.OptionalHeader64.MajorSubsystemVersion:=0;
    Result.imageheader.OptionalHeader64.MinorSubsystemVersion:=0;
    Result.imageheader.OptionalHeader64.Checksum:=0;
    Result.imageheader.OptionalHeader64.ImageBase:=$00000000;
-   Result.imageheader.OptionalHeader64.BaseOfCode:=Result.seccontentaddress;
+   Result.imageheader.OptionalHeader64.BaseOfCode:=petextaddress;
    Result.ImageHeader.OptionalHeader64.SectionAlignment:=addralign;
    Result.imageheader.OptionalHeader64.Subsystem:=apptype;
    Result.imageheader.OptionalHeader64.Win32VersionValue:=0;
@@ -1042,7 +1118,7 @@ begin
    if(haverodata) then
     begin
      i:=1;
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elfrodataaddress-elftextaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffiletextend-elffiletextstart);
      for j:=1 to textlist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(textlist.secindex+j-1)^-1)^.ptr1);
@@ -1054,7 +1130,7 @@ begin
        conv_move(Pbyte(tempaddress1)^,Pbyte(tempaddress2)^,tempsize);
       end;
      inc(i);
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elfdataaddress-elfrodataaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffilerodataend-elffilerodatastart);
      for j:=1 to rodatalist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(rodatalist.secindex+j-1)^-1)^.ptr1);
@@ -1066,7 +1142,7 @@ begin
        conv_move(Pbyte(tempaddress1)^,Pbyte(tempaddress2)^,tempsize);
       end;
      inc(i);
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(highaddress-elfdataaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffiledataend-elffiledatastart);
      for j:=1 to datalist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(datalist.secindex+j-1)^-1)^.ptr1);
@@ -1081,7 +1157,7 @@ begin
    else
     begin
      i:=1;
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elfdataaddress-elftextaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffiletextend-elffiletextstart);
      for j:=1 to textlist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(textlist.secindex+j-1)^-1)^.ptr1);
@@ -1093,7 +1169,7 @@ begin
        conv_move(Pbyte(tempaddress1)^,Pbyte(tempaddress2)^,tempsize);
       end;
      inc(i);
-     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(highaddress-elfdataaddress);
+     Ppe_content(Result.seccontent+i-1)^.ptr1:=conv_allocmem(elffiledataend-elffiledatastart);
      for j:=1 to datalist.seccount do
       begin
        tempaddress1:=SizeUint(Pelf_content(elf.seccontent+(datalist.secindex+j-1)^-1)^.ptr1);
@@ -1112,42 +1188,44 @@ begin
      j:=1; typeoffsetcount:=Pelf64_rela_item(rela.list64.item+i-1)^.count;
      while(j<=typeoffsetcount)do
       begin
-       newoffset:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset
-       -elftextaddress+Result.seccontentaddress;
-       newaddend:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_addend
-       -elftextaddress+Result.seccontentaddress;
-       {Search for the address exists}
-       if(elfrodataaddress=0) then
+       {Find the Relative Offset in PE file and write the add number}
+       peRelaoffset:=conv_get_efi_relative_offset(elftextaddress,elfrodataaddress,elfdataaddress,
+       pefiletextoffset,pefilerodataoffset,pefiledataoffset,
+       Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset);
+       newoffset:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset;
+       newaddend:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_addend;
+       if(pefilerodataoffset<>0) then
         begin
-         if(Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset<=elfdataaddress) then
+         if(newoffset>=pefiledataoffset) then
           begin
-           writeoffset:=newoffset-Result.seccontentaddress;
-           Pqword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
+           writeoffset:=PeRelaOffset.offset;
+           Pqword(Ppe_content(Result.seccontent+2)^.ptr1+writeoffset)^:=newaddend;
           end
-         else if(Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset<=highaddress) then
+         else if(newoffset>=pefilerodataoffset) then
           begin
-           writeoffset:=newoffset-Result.seccontentaddress-(elfdataaddress-elftextaddress);
+           writeoffset:=PeRelaOffset.offset;
            Pqword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
+          end
+         else
+          begin
+           writeoffset:=PeRelaOffset.offset;
+           Pqword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
           end;
         end
        else
         begin
-         if(Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset<=elfrodataaddress) then
+         if(newoffset>=pefiledataoffset) then
           begin
-           writeoffset:=newoffset-Result.seccontentaddress;
-           Pqword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
-          end
-         else if(Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset<=elfdataaddress) then
-          begin
-           writeoffset:=newoffset-Result.seccontentaddress-(elfrodataaddress-elftextaddress);
+           writeoffset:=PeRelaOffset.offset;
            Pqword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
           end
-         else if(Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset<=highaddress) then
+         else
           begin
-           writeoffset:=newoffset-Result.seccontentaddress-(elfdataaddress-elftextaddress);
-           Pqword(Ppe_content(Result.seccontent+2)^.ptr1+writeoffset)^:=newaddend;
+           writeoffset:=PeRelaOffset.offset;
+           Pqword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
           end;
         end;
+       {If block exceeds limits,then create another block}
        if(j=1) or (newoffset-baseoffset>4095) then
         begin
          inc(breloclist.count); inc(relocsize,8);
@@ -1262,15 +1340,14 @@ begin
     begin
      Ppe_image_section_header(Result.secheader+i-1)^.Name:='.text';
      if(haverodata) then
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=elfrodataaddress-elftextaddress
-     else Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=elfdataaddress-elftextaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=perodataaddress-petextaddress
+     else Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=pedataaddress-petextaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.NumberOfLineNumbers:=0;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToLineNumbers:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize;
-     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=Result.seccontentaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=elffiletextend-elffiletextstart;
+     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pefiletextoffset;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToRelocation:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=Result.seccontentaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=petextaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.Characteristics:=
      pe_image_scn_cnt_code or pe_image_mem_read or pe_image_mem_execute;
     end;
@@ -1278,15 +1355,13 @@ begin
     begin
      inc(i);
      Ppe_image_section_header(Result.secheader+i-1)^.Name:='.rdata';
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=elfdataaddress-elfrodataaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=pedataaddress-perodataaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.NumberOfLineNumbers:=0;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToLineNumbers:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize;
-     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=perodataaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=elffilerodataend-elffilerodatastart;
+     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pefilerodataoffset;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToRelocation:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=elfrodataaddress-elftextaddress+
-     Result.seccontentaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=perodataaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.Characteristics:=
      pe_image_scn_cnt_initialized_data or pe_image_mem_read;
     end;
@@ -1294,14 +1369,13 @@ begin
     begin
      inc(i);
      Ppe_image_section_header(Result.secheader+i-1)^.Name:='.data';
-     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=highaddress-elfdataaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.Misc.VirtualSize:=perelocaddress-pedataaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.NumberOfLineNumbers:=0;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToLineNumbers:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=perelocaddress-pedataaddress;
-     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pedataaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=elffiledataend-elffiledatastart;
+     Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pefiledataoffset;
      Ppe_image_section_header(Result.secheader+i-1)^.PointerToRelocation:=0;
-     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=elfdataaddress-elftextaddress+
-     Result.seccontentaddress;
+     Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=pedataaddress;
      Ppe_image_section_header(Result.secheader+i-1)^.Characteristics:=
      pe_image_scn_cnt_initialized_data or pe_image_mem_read or pe_image_mem_write;
     end;
@@ -1311,22 +1385,21 @@ begin
    Ppe_image_section_header(Result.secheader+i-1)^.NumberOfLineNumbers:=0;
    Ppe_image_section_header(Result.secheader+i-1)^.PointerToLineNumbers:=0;
    Ppe_image_section_header(Result.secheader+i-1)^.SizeOfRawData:=relocsize;
-   Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=perelocaddress;
+   Ppe_image_section_header(Result.secheader+i-1)^.PointerToRawData:=pefilerelocoffset;
    Ppe_image_section_header(Result.secheader+i-1)^.PointerToRelocation:=0;
-   Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=highaddress
-   -elftextaddress+Result.seccontentaddress;
+   Ppe_image_section_header(Result.secheader+i-1)^.VirtualAddress:=perelocaddress;
    Ppe_image_section_header(Result.secheader+i-1)^.Characteristics:=
    pe_image_scn_cnt_initialized_data or pe_image_mem_read or pe_image_mem_discardable;
-   Result.imageheader.OptionalHeader64.DataDirectory[6].virtualaddress:=highaddress
-   -elftextaddress+Result.seccontentaddress;
+   Result.imageheader.OptionalHeader64.DataDirectory[6].virtualaddress:=perelocaddress;
    Result.ImageHeader.OptionalHeader64.DataDirectory[6].Size:=relocsize;
    Result.imageheader.OptionalHeader64.FileAlignment:=addralign;
+   pefileSize:=(pefilerelocoffset+relocsize+addralign-1) div addralign*addralign;
+   Result.peSize:=pefileSize;
    Result.imageheader.OptionalHeader64.SizeOfImage:=
    (perelocaddress+relocsize+addralign-1) div addralign*addralign;
    Result.ImageHeader.OptionalHeader64.Checksum:=0;
-   efibuf:=conv_efi_to_buffer(Result);
-   Result.ImageHeader.OptionalHeader64.Checksum:=
-   conv_generate_crc32(efibuf,Result.ImageHeader.OptionalHeader64.SizeOfImage,$FFFFFFFF);
+   efibuf:=conv_efi_to_buffer(Result,pefileSize);
+   Result.ImageHeader.OptionalHeader64.Checksum:=conv_generate_crc32(efibuf,pefilesize,0);
    conv_freemem(efibuf);
   end;
 end;
@@ -1334,17 +1407,17 @@ procedure conv_efi_write(efi:pe_file;fn:string);
 var efibuf:Pbyte;
     i:SizeUint;
 begin
- efibuf:=conv_efi_to_buffer(efi);
+ efibuf:=conv_efi_to_buffer(efi,efi.peSize);
  if(efi.bit=32) then
   begin
-   for i:=1 to efi.imageheader.OptionalHeader.SizeOfImage shr 2 do
+   for i:=1 to efi.peSize shr 2 do
     begin
      conv_io_write(fn,Pdword(efibuf+(i-1)*4)^,(i-1)*4,4);
     end;
   end
  else if(efi.bit=64) then
   begin
-   for i:=1 to efi.imageheader.OptionalHeader64.SizeOfImage shr 2 do
+   for i:=1 to efi.PeSize shr 2 do
     begin
      conv_io_write(fn,Pdword(efibuf+(i-1)*4)^,(i-1)*4,4);
     end;
