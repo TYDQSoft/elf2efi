@@ -10,7 +10,7 @@ var elffile:elf_file;
     i:SizeUint;
 
 begin
- writeln('elf2efi(elf file to efi file converter) alpha v0.0.5');
+ writeln('elf2efi(elf file to efi file converter) alpha v0.0.6');
  if(ParamCount<2) or (ParamCount>3) then
   begin
    if(ParamCount<1) then writeln('elf2efi:no command,show the help.')

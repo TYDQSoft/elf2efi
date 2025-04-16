@@ -450,6 +450,8 @@ var entrystart,highaddress,addralign:SizeUint;
     peRelaoffset:file_relative_offset;
     {For File Size}
     peFileSize:SizeUint;
+    {For ELF File to PE File Comparsion}
+    islower:boolean;
 begin
  {Initialize the file offset}
  elffiletextstart:=0; elffiletextend:=0;
@@ -591,8 +593,8 @@ begin
    sizeof(pe_image_section_header)*Result.imageheader.FileHeader.NumberOfSections+
    addralign-1) div addralign*addralign;
    {Make it ELF executable compatible}
-   if(Result.seccontentaddress<=elftextaddress) then petextaddress:=elftextaddress
-   else petextaddress:=Result.seccontentaddress;
+   islower:=Result.seccontentaddress>elftextaddress;
+   if(islower) then petextaddress:=Result.seccontentaddress else petextaddress:=elftextaddress;
    Result.seccontent:=conv_allocmem(sizeof(pe_content)*efiseccount);
    {Generate the PE section position}
    if(elfrodataaddress<>0) then
@@ -615,10 +617,8 @@ begin
      pefilerelocoffset:=pefiledataoffset+elffiledataend-elffiledatastart;
     end;
    {Generate the Optional Header}
-   if(petextaddress=elftextaddress) then
-   Result.imageheader.OptionalHeader.AddressOfEntryPoint:=entrystart
-   else
-   Result.imageheader.OptionalHeader.AddressOfEntryPoint:=entrystart-elftextaddress+petextaddress;
+   if(islower) then Result.imageheader.OptionalHeader.AddressOfEntryPoint:=entrystart-elftextaddress+petextaddress
+   else Result.imageheader.OptionalHeader.AddressOfEntryPoint:=entrystart;
    Result.imageheader.OptionalHeader.Magic:=pe_image_pe32plus_image_magic;
    Result.imageheader.OptionalHeader.MajorLinkerVersion:=0;
    Result.imageheader.OptionalHeader.MinorLinkerVersion:=0;
@@ -739,36 +739,46 @@ begin
        peRelaoffset:=conv_get_efi_relative_offset(elftextaddress,elfrodataaddress,elfdataaddress,
        pefiletextoffset,pefilerodataoffset,pefiledataoffset,
        Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset);
-       newoffset:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset;
-       newaddend:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_addend;
+       if(islower) then
+        begin
+         newoffset:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset
+         +Result.seccontentaddress-elftextaddress;
+         newaddend:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_addend
+         +Result.seccontentaddress-elftextaddress;
+        end
+       else
+        begin
+         newoffset:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_offset;
+         newaddend:=Pelf32_rela(Pelf32_rela_item(rela.list32.item+i-1)^.rela+j-1)^.rela_addend;
+        end;
        if(pefilerodataoffset<>0) then
         begin
-         if(newoffset>=pefiledataoffset) then
+         if(peRelaOffset.BaseAddr=pefiledataoffset) then
           begin
-           writeoffset:=newoffset-pefiledataoffset;
+           writeoffset:=peRelaOffset.Offset;
            Pdword(Ppe_content(Result.seccontent+2)^.ptr1+writeoffset)^:=newaddend;
           end
-         else if(newoffset>=pefilerodataoffset) then
+         else if(peRelaOffset.BaseAddr=pefilerodataoffset) then
           begin
-           writeoffset:=newoffset-pefilerodataoffset;
+           writeoffset:=peRelaOffset.Offset;
            Pdword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
           end
          else
           begin
-           writeoffset:=newoffset-pefiletextoffset;
+           writeoffset:=peRelaOffset.Offset;
            Pdword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
           end;
         end
        else
         begin
-         if(newoffset>=pefiledataoffset) then
+         if(peRelaOffset.BaseAddr=pefiledataoffset) then
           begin
-           writeoffset:=newoffset-pefiledataoffset;
+           writeoffset:=peRelaOffset.Offset;
            Pdword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
           end
          else
           begin
-           writeoffset:=newoffset-pefiletextoffset;
+           writeoffset:=peRelaOffset.Offset;
            Pdword(Ppe_content(Result.seccontent)^.ptr1+writeoffset)^:=newaddend;
           end;
         end;
@@ -1054,8 +1064,8 @@ begin
    sizeof(pe_image_section_header)*Result.imageheader.FileHeader.NumberOfSections+
    addralign-1) div addralign*addralign;
    {Make it ELF executable compatible}
-   if(Result.seccontentaddress<=elftextaddress) then petextaddress:=elftextaddress
-   else petextaddress:=Result.seccontentaddress;
+   islower:=Result.seccontentaddress>elftextaddress;
+   if(islower) then petextaddress:=Result.seccontentaddress else petextaddress:=elftextaddress;
    Result.seccontent:=conv_allocmem(sizeof(pe_content)*efiseccount);
    {Generate the PE section position}
    if(elfrodataaddress<>0) then
@@ -1078,10 +1088,8 @@ begin
      pefilerelocoffset:=pefiledataoffset+elffiledataend-elffiledatastart;
     end;
    {Generate the Optional Header}
-   if(petextaddress=elftextaddress) then
-   Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=entrystart
-   else
-   Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=entrystart-elftextaddress+petextaddress;
+   if(islower) then Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=entrystart-elftextaddress+petextaddress
+   else Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=entrystart;
    Result.imageheader.OptionalHeader64.Magic:=pe_image_pe32plus_image_magic;
    Result.imageheader.OptionalHeader64.MajorLinkerVersion:=0;
    Result.imageheader.OptionalHeader64.MinorLinkerVersion:=0;
@@ -1200,16 +1208,26 @@ begin
        peRelaoffset:=conv_get_efi_relative_offset(elftextaddress,elfrodataaddress,elfdataaddress,
        pefiletextoffset,pefilerodataoffset,pefiledataoffset,
        Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset);
-       newoffset:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset;
-       newaddend:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_addend;
+       if(islower) then
+        begin
+         newoffset:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset
+         +Result.seccontentaddress-elftextaddress;
+         newaddend:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_addend
+         +Result.seccontentaddress-elftextaddress;
+        end
+       else
+        begin
+         newoffset:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_offset;
+         newaddend:=Pelf64_rela(Pelf64_rela_item(rela.list64.item+i-1)^.rela+j-1)^.rela_addend;
+        end;
        if(pefilerodataoffset<>0) then
         begin
-         if(newoffset>=pefiledataoffset) then
+         if(peRelaOffset.BaseAddr=pefiledataoffset) then
           begin
            writeoffset:=PeRelaOffset.offset;
            Pqword(Ppe_content(Result.seccontent+2)^.ptr1+writeoffset)^:=newaddend;
           end
-         else if(newoffset>=pefilerodataoffset) then
+         else if(peRelaOffset.BaseAddr=pefilerodataoffset) then
           begin
            writeoffset:=PeRelaOffset.offset;
            Pqword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
@@ -1222,7 +1240,7 @@ begin
         end
        else
         begin
-         if(newoffset>=pefiledataoffset) then
+         if(peRelaOffset.BaseAddr=pefiledataoffset) then
           begin
            writeoffset:=PeRelaOffset.offset;
            Pqword(Ppe_content(Result.seccontent+1)^.ptr1+writeoffset)^:=newaddend;
