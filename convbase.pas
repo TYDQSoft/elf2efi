@@ -591,7 +591,8 @@ begin
    sizeof(pe_image_section_header)*Result.imageheader.FileHeader.NumberOfSections+
    addralign-1) div addralign*addralign;
    {Make it ELF executable compatible}
-   petextaddress:=elftextaddress;
+   if(Result.seccontentaddress<=elftextaddress) then petextaddress:=elftextaddress
+   else petextaddress:=Result.seccontentaddress;
    Result.seccontent:=conv_allocmem(sizeof(pe_content)*efiseccount);
    {Generate the PE section position}
    if(elfrodataaddress<>0) then
@@ -614,7 +615,10 @@ begin
      pefilerelocoffset:=pefiledataoffset+elffiledataend-elffiledatastart;
     end;
    {Generate the Optional Header}
-   Result.imageheader.OptionalHeader.AddressOfEntryPoint:=entrystart;
+   if(petextaddress=elftextaddress) then
+   Result.imageheader.OptionalHeader.AddressOfEntryPoint:=entrystart
+   else
+   Result.imageheader.OptionalHeader.AddressOfEntryPoint:=entrystart-elftextaddress+petextaddress;
    Result.imageheader.OptionalHeader.Magic:=pe_image_pe32plus_image_magic;
    Result.imageheader.OptionalHeader.MajorLinkerVersion:=0;
    Result.imageheader.OptionalHeader.MinorLinkerVersion:=0;
@@ -1050,7 +1054,8 @@ begin
    sizeof(pe_image_section_header)*Result.imageheader.FileHeader.NumberOfSections+
    addralign-1) div addralign*addralign;
    {Make it ELF executable compatible}
-   petextaddress:=elftextaddress;
+   if(Result.seccontentaddress<=elftextaddress) then petextaddress:=elftextaddress
+   else petextaddress:=Result.seccontentaddress;
    Result.seccontent:=conv_allocmem(sizeof(pe_content)*efiseccount);
    {Generate the PE section position}
    if(elfrodataaddress<>0) then
@@ -1073,7 +1078,10 @@ begin
      pefilerelocoffset:=pefiledataoffset+elffiledataend-elffiledatastart;
     end;
    {Generate the Optional Header}
-   Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=entrystart;
+   if(petextaddress=elftextaddress) then
+   Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=entrystart
+   else
+   Result.imageheader.OptionalHeader64.AddressOfEntryPoint:=entrystart-elftextaddress+petextaddress;
    Result.imageheader.OptionalHeader64.Magic:=pe_image_pe32plus_image_magic;
    Result.imageheader.OptionalHeader64.MajorLinkerVersion:=0;
    Result.imageheader.OptionalHeader64.MinorLinkerVersion:=0;
